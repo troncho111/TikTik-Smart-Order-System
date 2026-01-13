@@ -64,6 +64,12 @@ The project's ambition is to streamline the sales process, improve customer expe
   - **Quick Selection**: "⭐ הופעות שמורות" option in artist dropdown to select previously saved concerts
   - **Management Page**: Sidebar tool "⭐ הופעות שמורות" to view and delete saved concerts
   - **Database Storage**: `SavedConcert` model stores artist, venue, city, country, date, time, and category
+- **Package Templates**: Reusable package templates for recurring events with same flights/hotels. Features:
+  - **Create Templates**: Save complete packages (event, flights, hotel, pricing) as templates via "📦 חבילות קבועות" sidebar
+  - **Load in Orders**: Select a saved package in new order form to auto-fill all fields except passenger details
+  - **Duplicate/Edit/Delete**: Manage templates with copy functionality for variations (e.g., same event with different ticket categories)
+  - **Database Storage**: `PackageTemplate` model stores event info, flights JSON, hotel JSON, pricing, stadium maps (binary)
+  - **Quick Workflow**: Agents only need to add passenger details when using a template
 - **Help Page**: Comprehensive Hebrew user guide accessible via "❓ עזרה" button in sidebar. Features:
   - System overview and capabilities
   - Step-by-step guide for creating orders
