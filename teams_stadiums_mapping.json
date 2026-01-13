@@ -48,7 +48,7 @@
       "country": "England",
       "league": "Premier League",
       "capacity": 53400,
-      "map_filename": "man_city.svg"
+      "map_filename": "man_city.png"
     },
     {
       "id": "liverpool",
@@ -87,7 +87,7 @@
       "country": "England",
       "league": "Premier League",
       "capacity": 40341,
-      "map_filename": "chelsea.svg"
+      "map_filename": "chelsea.png"
     },
     {
       "id": "tottenham",
@@ -113,7 +113,7 @@
       "country": "England",
       "league": "Premier League",
       "capacity": 52305,
-      "map_filename": "newcastle.svg"
+      "map_filename": "newcastle.png"
     },
     {
       "id": "west_ham",
@@ -126,7 +126,7 @@
       "country": "England",
       "league": "Premier League",
       "capacity": 62500,
-      "map_filename": "west_ham.svg"
+      "map_filename": "west_ham.png"
     },
     {
       "id": "juventus",
@@ -139,7 +139,7 @@
       "country": "Italy",
       "league": "Serie A",
       "capacity": 41507,
-      "map_filename": "juventus.svg"
+      "map_filename": "juventus.png"
     },
     {
       "id": "inter",
@@ -230,7 +230,7 @@
       "country": "Germany",
       "league": "Bundesliga",
       "capacity": 81365,
-      "map_filename": "dortmund.svg"
+      "map_filename": "dortmund.png"
     },
     {
       "id": "leipzig",
@@ -267,7 +267,7 @@
       "city_he": "",
       "country": "",
       "league": "Italian Serie A",
-      "map_filename": "Juventus.svg"
+      "map_filename": "Juventus.png"
     },
     {
       "id": "fulham",
@@ -280,7 +280,7 @@
       "country": "England",
       "league": "Premier League",
       "capacity": 25700,
-      "map_filename": "Fulham.svg"
+      "map_filename": "Fulham.png"
     }
   ]
 }
