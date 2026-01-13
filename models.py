@@ -39,6 +39,18 @@ class EventType(enum.Enum):
     CONCERT = "concert"
     OTHER = "other"
 
+class UserSession(Base):
+    __tablename__ = "user_sessions"
+    
+    id = Column(Integer, primary_key=True, index=True)
+    user_id = Column(Integer, ForeignKey('users.id'), nullable=False)
+    token = Column(String(64), unique=True, nullable=False, index=True)
+    created_at = Column(DateTime, default=datetime.utcnow)
+    expires_at = Column(DateTime, nullable=False)
+    last_seen = Column(DateTime, default=datetime.utcnow)
+    
+    user = relationship("User", back_populates="sessions")
+
 class User(Base):
     __tablename__ = "users"
     
@@ -53,6 +65,7 @@ class User(Base):
     last_login = Column(DateTime, nullable=True)
     
     orders = relationship("Order", back_populates="user")
+    sessions = relationship("UserSession", back_populates="user")
     
     def set_password(self, password):
         self.password_hash = bcrypt.hashpw(password.encode('utf-8'), bcrypt.gensalt()).decode('utf-8')
@@ -260,6 +273,92 @@ class SavedArtist(Base):
             'genre': self.genre,
             'image_url': self.image_url,
             'db_id': self.id
+        }
+
+class PackageTemplate(Base):
+    """Saved package templates for recurring events with same flights/hotels"""
+    __tablename__ = "package_templates"
+    
+    id = Column(Integer, primary_key=True, index=True)
+    name = Column(String(255), nullable=False)
+    event_type = Column(SQLEnum(EventType), default=EventType.CONCERT)
+    product_type = Column(String(50), default="full_package")
+    
+    event_name = Column(String(255))
+    event_date = Column(String(100))
+    event_time = Column(String(50))
+    venue = Column(String(255))
+    
+    ticket_description = Column(Text)
+    ticket_category = Column(String(100))
+    price_per_ticket_euro = Column(Float, default=0)
+    
+    hotel_data = Column(Text)
+    flight_data = Column(Text)
+    
+    package_price_euro = Column(Float, default=0)
+    
+    stadium_map_data = Column(LargeBinary, nullable=True)
+    stadium_map_mime = Column(String(50), nullable=True)
+    atmosphere_image_data = Column(LargeBinary, nullable=True)
+    atmosphere_image_mime = Column(String(50), nullable=True)
+    
+    notes = Column(Text, nullable=True)
+    
+    created_at = Column(DateTime, default=datetime.utcnow)
+    updated_at = Column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
+    is_active = Column(Boolean, default=True)
+    
+    def __repr__(self):
+        return f"<PackageTemplate {self.name}>"
+    
+    def to_dict(self):
+        import base64
+        import json
+        
+        map_data_b64 = None
+        if self.stadium_map_data:
+            map_data_b64 = base64.b64encode(self.stadium_map_data).decode('utf-8')
+        
+        atmo_data_b64 = None
+        if self.atmosphere_image_data:
+            atmo_data_b64 = base64.b64encode(self.atmosphere_image_data).decode('utf-8')
+        
+        hotel = {}
+        if self.hotel_data:
+            try:
+                hotel = json.loads(self.hotel_data)
+            except:
+                pass
+        
+        flights = {}
+        if self.flight_data:
+            try:
+                flights = json.loads(self.flight_data)
+            except:
+                pass
+        
+        return {
+            'id': self.id,
+            'name': self.name,
+            'event_type': self.event_type.value if self.event_type else 'concert',
+            'product_type': self.product_type or 'full_package',
+            'event_name': self.event_name,
+            'event_date': self.event_date,
+            'event_time': self.event_time,
+            'venue': self.venue,
+            'ticket_description': self.ticket_description,
+            'ticket_category': self.ticket_category,
+            'price_per_ticket_euro': self.price_per_ticket_euro or 0,
+            'hotel': hotel,
+            'flights': flights,
+            'package_price_euro': self.package_price_euro or 0,
+            'stadium_map_data': map_data_b64,
+            'stadium_map_mime': self.stadium_map_mime,
+            'atmosphere_image_data': atmo_data_b64,
+            'atmosphere_image_mime': self.atmosphere_image_mime,
+            'notes': self.notes,
+            'created_at': self.created_at.isoformat() if self.created_at else None
         }
 
 def run_migrations():
