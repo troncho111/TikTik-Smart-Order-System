@@ -3,40 +3,130 @@ import os
 import io
 import json
 import base64
-from datetime import datetime
+import secrets
+from datetime import datetime, timedelta
 from PIL import Image
 import tempfile
 import uuid
 import hashlib
-from models import Order, OrderStatus, EventType, AtmosphereImage, User, get_db, generate_order_number, init_db
+from models import Order, OrderStatus, EventType, AtmosphereImage, User, UserSession, PackageTemplate, get_db, generate_order_number, init_db
 
-def generate_session_token(user_id):
-    """Generate a session token for persistent login"""
-    secret = os.environ.get('SESSION_SECRET', 'tiktik-secret-key')
-    data = f"{user_id}-{secret}"
-    return hashlib.sha256(data.encode()).hexdigest()[:32]
+def generate_session_token():
+    """Generate a random session token"""
+    return secrets.token_hex(32)
+
+def create_user_session(user_id):
+    """Create a new session in database and return token"""
+    db = get_db()
+    if not db:
+        return None
+    try:
+        token = generate_session_token()
+        expires_at = datetime.utcnow() + timedelta(days=30)
+        
+        session = UserSession(
+            user_id=user_id,
+            token=token,
+            expires_at=expires_at
+        )
+        db.add(session)
+        db.commit()
+        return token
+    except Exception as e:
+        db.rollback()
+        print(f"Error creating session: {e}")
+        return None
+    finally:
+        db.close()
+
+def validate_session_token(token):
+    """Validate session token and return user if valid"""
+    if not token:
+        return None
+    db = get_db()
+    if not db:
+        return None
+    try:
+        session = db.query(UserSession).filter(
+            UserSession.token == token,
+            UserSession.expires_at > datetime.utcnow()
+        ).first()
+        
+        if session:
+            user = db.query(User).filter(User.id == session.user_id, User.is_active == True).first()
+            if user:
+                session.last_seen = datetime.utcnow()
+                db.commit()
+                return {
+                    'id': user.id,
+                    'username': user.username,
+                    'email': user.email,
+                    'full_name': user.full_name,
+                    'is_admin': user.is_admin
+                }
+        return None
+    except Exception as e:
+        print(f"Error validating session: {e}")
+        return None
+    finally:
+        db.close()
+
+def delete_user_session(token):
+    """Delete a session from database"""
+    if not token:
+        return
+    db = get_db()
+    if not db:
+        return
+    try:
+        db.query(UserSession).filter(UserSession.token == token).delete()
+        db.commit()
+    except:
+        db.rollback()
+    finally:
+        db.close()
 
 def restore_session_from_token():
-    """Try to restore user session from query params"""
+    """Try to restore user session from query params with database validation"""
     params = st.query_params
-    token = params.get('session')
+    token = params.get('token')
+    
+    # New database-backed token system
+    if token:
+        user = validate_session_token(token)
+        if user:
+            return user
+    
+    # Fallback to old hash-based system for backward compatibility
+    old_token = params.get('session')
     user_id = params.get('uid')
     
-    if token and user_id:
+    if old_token and user_id:
         db = get_db()
         if db:
             try:
+                secret = os.environ.get('SESSION_SECRET', 'tiktik-secret-key')
+                data = f"{user_id}-{secret}"
+                expected_token = hashlib.sha256(data.encode()).hexdigest()[:32]
+                
                 user = db.query(User).filter(User.id == int(user_id), User.is_active == True).first()
-                if user:
-                    expected_token = generate_session_token(user.id)
-                    if token == expected_token:
-                        return {
-                            'id': user.id,
-                            'username': user.username,
-                            'email': user.email,
-                            'full_name': user.full_name,
-                            'is_admin': user.is_admin
-                        }
+                if user and old_token == expected_token:
+                    # Migrate to new database-backed session
+                    new_token = create_user_session(user.id)
+                    if new_token:
+                        st.query_params['token'] = new_token
+                        # Clean up old params
+                        if 'session' in st.query_params:
+                            del st.query_params['session']
+                        if 'uid' in st.query_params:
+                            del st.query_params['uid']
+                    return {
+                        'id': user.id,
+                        'username': user.username,
+                        'email': user.email,
+                        'full_name': user.full_name,
+                        'is_admin': user.is_admin
+                    }
             except:
                 pass
             finally:
@@ -44,13 +134,17 @@ def restore_session_from_token():
     return None
 
 def set_session_token(user):
-    """Set session token in query params for persistence"""
-    token = generate_session_token(user['id'])
-    st.query_params['session'] = token
-    st.query_params['uid'] = str(user['id'])
+    """Set session token in URL query params for persistence"""
+    token = create_user_session(user['id'])
+    if token:
+        st.query_params['token'] = token
 
 def clear_session_token():
     """Clear session token from query params"""
+    token = st.query_params.get('token')
+    if token:
+        delete_user_session(token)
+        del st.query_params['token']
     if 'session' in st.query_params:
         del st.query_params['session']
     if 'uid' in st.query_params:
@@ -814,25 +908,51 @@ def generate_pdf(order_data, stadium_image=None, hotel_image=None, hotel_image_2
     hotel_image_2_path = None
     stadium_photo_path = None
     
+    def save_image_safely(img, prefix="img"):
+        """Safely save an image to temp file, handling various formats"""
+        try:
+            if img is None:
+                return None
+            
+            # If it's bytes, try to load as PIL Image first
+            if isinstance(img, bytes):
+                try:
+                    img = Image.open(io.BytesIO(img))
+                except Exception:
+                    return None
+            
+            # Convert to RGB if needed (for PNG with transparency, RGBA, etc.)
+            if not isinstance(img, Image.Image):
+                return None
+            
+            if img.mode in ('RGBA', 'LA', 'P'):
+                # Create white background for transparency
+                background = Image.new('RGB', img.size, (255, 255, 255))
+                if img.mode == 'P':
+                    img = img.convert('RGBA')
+                background.paste(img, mask=img.split()[-1] if img.mode in ('RGBA', 'LA') else None)
+                img = background
+            elif img.mode != 'RGB':
+                img = img.convert('RGB')
+            
+            with tempfile.NamedTemporaryFile(suffix='.png', delete=False, prefix=prefix) as tmp:
+                img.save(tmp.name, 'PNG', optimize=True)
+                return tmp.name
+        except Exception as e:
+            print(f"Error saving image: {e}")
+            return None
+    
     if stadium_image:
-        with tempfile.NamedTemporaryFile(suffix='.png', delete=False) as tmp:
-            stadium_image.save(tmp.name)
-            stadium_image_path = tmp.name
+        stadium_image_path = save_image_safely(stadium_image, "stadium_")
     
     if stadium_photo:
-        with tempfile.NamedTemporaryFile(suffix='.png', delete=False) as tmp:
-            stadium_photo.save(tmp.name)
-            stadium_photo_path = tmp.name
+        stadium_photo_path = save_image_safely(stadium_photo, "atmosphere_")
     
     if hotel_image:
-        with tempfile.NamedTemporaryFile(suffix='.png', delete=False) as tmp:
-            hotel_image.save(tmp.name)
-            hotel_image_path = tmp.name
+        hotel_image_path = save_image_safely(hotel_image, "hotel_")
     
     if hotel_image_2:
-        with tempfile.NamedTemporaryFile(suffix='.png', delete=False) as tmp:
-            hotel_image_2.save(tmp.name)
-            hotel_image_2_path = tmp.name
+        hotel_image_2_path = save_image_safely(hotel_image_2, "hotel2_")
     
     pdf_data = {
         'product_type': order_data.get('product_type', 'tickets'),
@@ -1234,6 +1354,12 @@ def page_new_order():
     """New order page"""
     render_header()
     
+    if st.session_state.get('package_loaded_success'):
+        pkg_name = st.session_state['package_loaded_success']
+        st.success(f"✅ נטענה חבילה: {pkg_name}")
+        st.info("💡 עכשיו רק צריך להוסיף פרטי נוסעים ולקוח!")
+        del st.session_state['package_loaded_success']
+    
     if 'passengers' not in st.session_state:
         st.session_state.passengers = []
     if 'order_generated' not in st.session_state:
@@ -1259,6 +1385,109 @@ def page_new_order():
             format_func=lambda x: "🎫 כרטיסים בלבד" if x == "tickets" else "✈️ חבילה מלאה (טיסה + מלון + כרטיס)",
             horizontal=True
         )
+        
+        st.markdown('<div class="form-section"><h3>📦 טעינה מחבילה קבועה</h3></div>', unsafe_allow_html=True)
+        
+        db = get_db()
+        saved_packages = []
+        if db:
+            try:
+                saved_packages = db.query(PackageTemplate).filter(PackageTemplate.is_active == True).order_by(PackageTemplate.name).all()
+            except:
+                pass
+            finally:
+                db.close()
+        
+        if saved_packages:
+            package_options = ["-- בחר חבילה --"] + [f"{pkg.name}" for pkg in saved_packages]
+            package_ids = [None] + [pkg.id for pkg in saved_packages]
+            
+            selected_package_idx = st.selectbox(
+                "📦 טען פרטים מחבילה שמורה",
+                range(len(package_options)),
+                format_func=lambda x: package_options[x],
+                key="load_package_select"
+            )
+            
+            if selected_package_idx and selected_package_idx > 0:
+                pkg_id = package_ids[selected_package_idx]
+                selected_pkg = next((p for p in saved_packages if p.id == pkg_id), None)
+                
+                if selected_pkg and st.button("📥 טען חבילה", type="primary", use_container_width=True):
+                    pkg_data = selected_pkg.to_dict()
+                    
+                    product_val = "package" if pkg_data.get('product_type') == 'full_package' else "tickets"
+                    event_type_map = {'concert': 'הופעה', 'football': 'כדורגל', 'other': 'אחר'}
+                    
+                    flights = pkg_data.get('flights', {})
+                    hotel = pkg_data.get('hotel', {})
+                    
+                    st.session_state.random_data = {
+                        'product_type': product_val,
+                        'event_name': pkg_data.get('event_name', ''),
+                        'event_date': pkg_data.get('event_date', ''),
+                        'event_time': pkg_data.get('event_time', ''),
+                        'venue': pkg_data.get('venue', ''),
+                        'event_type': event_type_map.get(pkg_data.get('event_type'), 'הופעה'),
+                        'category': pkg_data.get('ticket_category', ''),
+                        'ticket_description': pkg_data.get('ticket_description', ''),
+                        'price_euro': int(pkg_data.get('package_price_euro', 0) or 0),
+                        'hotel_name': hotel.get('name', ''),
+                        'hotel_checkin': hotel.get('check_in', ''),
+                        'hotel_checkout': hotel.get('check_out', ''),
+                        'outbound_from': flights.get('outbound', {}).get('from', ''),
+                        'outbound_to': flights.get('outbound', {}).get('to', ''),
+                        'outbound_date': flights.get('outbound', {}).get('date', ''),
+                        'outbound_time': flights.get('outbound', {}).get('time', ''),
+                        'outbound_flight': flights.get('outbound', {}).get('flight_number', ''),
+                        'return_from': flights.get('return', {}).get('from', ''),
+                        'return_to': flights.get('return', {}).get('to', ''),
+                        'return_date': flights.get('return', {}).get('date', ''),
+                        'return_time': flights.get('return', {}).get('time', ''),
+                        'return_flight': flights.get('return', {}).get('flight_number', ''),
+                        'loaded_from_package': pkg_data.get('name', ''),
+                        'package_notes': pkg_data.get('notes', '')
+                    }
+                    
+                    if flights.get('outbound'):
+                        st.session_state['flight_outbound_from'] = flights['outbound'].get('from', '')
+                        st.session_state['flight_outbound_to'] = flights['outbound'].get('to', '')
+                        st.session_state['flight_outbound_date'] = flights['outbound'].get('date', '')
+                        st.session_state['flight_outbound_time'] = flights['outbound'].get('time', '')
+                        st.session_state['flight_outbound_no'] = flights['outbound'].get('flight_number', '')
+                    if flights.get('return'):
+                        st.session_state['flight_return_from'] = flights['return'].get('from', '')
+                        st.session_state['flight_return_to'] = flights['return'].get('to', '')
+                        st.session_state['flight_return_date'] = flights['return'].get('date', '')
+                        st.session_state['flight_return_time'] = flights['return'].get('time', '')
+                        st.session_state['flight_return_no'] = flights['return'].get('flight_number', '')
+                    
+                    if pkg_data.get('stadium_map_data'):
+                        import base64
+                        map_bytes = base64.b64decode(pkg_data['stadium_map_data'])
+                        st.session_state['saved_stadium_map_bytes'] = map_bytes
+                        st.session_state['package_stadium_map_loaded'] = True
+                    
+                    if hotel:
+                        st.session_state.hotel_data = {
+                            'hotel_name': hotel.get('name', ''),
+                            'hotel_address': hotel.get('address', ''),
+                            'hotel_website': hotel.get('website', ''),
+                            'hotel_rating': hotel.get('rating', 0),
+                            'hotel_stars': hotel.get('stars', '5 כוכבים'),
+                            'hotel_image_path': hotel.get('image_path', ''),
+                            'hotel_image_path_2': hotel.get('image_path_2', ''),
+                            'hotel_checkin': hotel.get('check_in', ''),
+                            'hotel_checkout': hotel.get('check_out', ''),
+                            'from_package': True
+                        }
+                    
+                    st.session_state['package_loaded_success'] = pkg_data.get('name')
+                    st.rerun()
+        else:
+            st.caption("💡 אין חבילות שמורות. צור חבילות דרך 'חבילות קבועות' בתפריט.")
+        
+        st.markdown("---")
         
         if st.button("🎲 מילוי רנדומלי לבדיקה", type="secondary"):
             import random
@@ -1433,7 +1662,6 @@ def page_new_order():
             is_worldcup = selected_league == "מונדיאל 2026"
             
             if is_worldcup:
-                import json
                 try:
                     with open('worldcup2026.json', 'r', encoding='utf-8') as f:
                         wc_data = json.load(f)
@@ -1614,6 +1842,7 @@ def page_new_order():
             artist_options = ["-- בחר אמן --"]
             if saved_concerts:
                 artist_options.append("⭐ הופעות שמורות")
+            artist_options.append("📸 סריקת הופעה מתמונה")
             artist_options += [f"{a['name_he']} ({a['name_en']})" for a in popular_artists]
             if saved_artists:
                 artist_options += [f"⭐ {a['name_he']} ({a['name_en']})" for a in saved_artists]
@@ -1701,6 +1930,127 @@ def page_new_order():
                         st.session_state['concert_selected_category'] = selected_cat
                 else:
                     st.info("אין הופעות שמורות. שמור הופעות מ'הזנה ידנית' כדי לראות אותן כאן.")
+            
+            elif selected_artist_option == "📸 סריקת הופעה מתמונה":
+                from concert_ocr import extract_concert_data
+                
+                st.markdown("##### 📸 סריקת הופעה מתמונה")
+                st.info("💡 העלה צילום מסך של דף ההופעה והמערכת תחלץ את הפרטים אוטומטית")
+                
+                col_upload, col_paste = st.columns([3, 1])
+                with col_upload:
+                    concert_screenshot = st.file_uploader(
+                        "📷 העלה צילום מסך של דף האירוע",
+                        type=['png', 'jpg', 'jpeg'],
+                        key="concert_ocr_upload",
+                        help="צלם מסך מאתר המכירות והעלה כאן"
+                    )
+                with col_paste:
+                    concert_paste = paste_image_button("📋 הדבק", key="concert_ocr_paste")
+                    if concert_paste.image_data:
+                        st.session_state['concert_pasted_image'] = concert_paste.image_data
+                        st.image(concert_paste.image_data, caption="תמונה שהודבקה", width=100)
+                
+                concert_image_to_scan = concert_screenshot or st.session_state.get('concert_pasted_image')
+                
+                scan_concert_btn = st.button("🔍 סרוק פרטי הופעה", type="primary", use_container_width=True, key="scan_concert_btn")
+                
+                if st.session_state.get('concert_ocr_result'):
+                    ocr_result = st.session_state['concert_ocr_result']
+                    st.success("✅ הסריקה הושלמה! הפרטים מולאו בטופס למטה.")
+                    
+                    st.markdown("**פרטים שזוהו:**")
+                    if ocr_result.get('artist_name'):
+                        st.write(f"🎤 אמן: {ocr_result.get('artist_name')}")
+                    if ocr_result.get('event_name'):
+                        st.write(f"🎭 אירוע: {ocr_result.get('event_name')}")
+                    if ocr_result.get('event_date'):
+                        st.write(f"📅 תאריך: {ocr_result.get('event_date')} {ocr_result.get('event_time', '')}")
+                    if ocr_result.get('venue_name'):
+                        st.write(f"📍 מקום: {ocr_result.get('venue_name')}, {ocr_result.get('venue_city', '')}")
+                    if ocr_result.get('categories'):
+                        cats = ocr_result.get('categories', [])
+                        if cats:
+                            st.write("🎫 קטגוריות:")
+                            for cat in cats[:5]:
+                                price_str = f" - €{cat.get('price')}" if cat.get('price') else ""
+                                st.write(f"  • {cat.get('name', 'כללי')}{price_str}")
+                    
+                    st.session_state['concert_artist_en'] = ocr_result.get('artist_name', '')
+                    st.session_state['concert_artist_he'] = ocr_result.get('artist_name', '')
+                    st.session_state['concert_venue_name'] = ocr_result.get('venue_name', '')
+                    st.session_state['concert_venue_city'] = ocr_result.get('venue_city', '')
+                    st.session_state['concert_venue_info'] = {
+                        'name_he': ocr_result.get('venue_name', ''),
+                        'city_he': ocr_result.get('venue_city', ''),
+                        'country': ocr_result.get('venue_country', '')
+                    }
+                    st.session_state['_ocr_event_name'] = ocr_result.get('event_name', '')
+                    st.session_state['_ocr_event_date'] = ocr_result.get('event_date', '')
+                    st.session_state['_ocr_event_time'] = ocr_result.get('event_time', '')
+                    st.session_state['_ocr_categories'] = ocr_result.get('categories', [])
+                    
+                    if ocr_result.get('categories'):
+                        cat_names = [c.get('name', 'General') for c in ocr_result.get('categories', [])]
+                        selected_ocr_cat = st.selectbox("🎫 בחר קטגוריה", cat_names, key="ocr_category_select")
+                        st.session_state['concert_selected_category'] = selected_ocr_cat
+                    
+                    st.markdown("---")
+                    if st.button("⭐ שמור הופעה לשימוש חוזר", use_container_width=True, key="save_ocr_concert"):
+                        from models import SavedConcert as SavedConcertModel
+                        db = get_db()
+                        if db:
+                            try:
+                                date_str = ocr_result.get('event_date', '')
+                                try:
+                                    from datetime import datetime as dt
+                                    if '/' in date_str:
+                                        parsed = dt.strptime(date_str, '%d/%m/%Y')
+                                        date_str = parsed.strftime('%Y-%m-%d')
+                                except:
+                                    pass
+                                
+                                new_concert = SavedConcertModel(
+                                    artist_name=ocr_result.get('artist_name', ''),
+                                    artist_name_he=ocr_result.get('artist_name', ''),
+                                    event_name=ocr_result.get('event_name', ''),
+                                    venue_name=ocr_result.get('venue_name', ''),
+                                    city=ocr_result.get('venue_city', ''),
+                                    country=ocr_result.get('venue_country', ''),
+                                    event_date=date_str,
+                                    event_time=ocr_result.get('event_time', ''),
+                                    category=st.session_state.get('concert_selected_category', 'General Admission'),
+                                    source='ocr'
+                                )
+                                db.add(new_concert)
+                                db.commit()
+                                st.success("✅ ההופעה נשמרה! תוכל לבחור אותה מ'הופעות שמורות'.")
+                            except Exception as e:
+                                db.rollback()
+                                st.error(f"❌ שגיאה בשמירה: {str(e)}")
+                            finally:
+                                db.close()
+                
+                if scan_concert_btn:
+                    if concert_image_to_scan:
+                        with st.spinner("🔍 סורק את פרטי ההופעה..."):
+                            if concert_screenshot:
+                                image_bytes = concert_screenshot.read()
+                            else:
+                                pasted_img = st.session_state['concert_pasted_image']
+                                img_byte_arr = io.BytesIO()
+                                pasted_img.save(img_byte_arr, format='PNG')
+                                image_bytes = img_byte_arr.getvalue()
+                            
+                            result = extract_concert_data(image_bytes)
+                            
+                            if result.get('success'):
+                                st.session_state['concert_ocr_result'] = result
+                                st.rerun()
+                            else:
+                                st.error(f"❌ לא הצלחנו לזהות פרטי הופעה: {result.get('error', 'נסה תמונה ברורה יותר')}")
+                    else:
+                        st.warning("⚠️ יש להעלות צילום מסך לפני הסריקה")
             
             elif selected_artist_option == "🔍 חיפוש אמן אחר...":
                 artist_search = st.text_input(
@@ -2310,12 +2660,16 @@ def page_new_order():
             else:
                 default_event_name = f"{home_heb} נגד "
         elif event_type == "הופעה" and not default_event_name:
-            artist_he = st.session_state.get('concert_artist_he', '')
-            venue_name = st.session_state.get('concert_venue_name', '')
-            if artist_he and venue_name:
-                default_event_name = f"הופעה של {artist_he} ב{venue_name}"
-            elif artist_he:
-                default_event_name = f"הופעה של {artist_he}"
+            ocr_event_name = st.session_state.get('_ocr_event_name', '')
+            if ocr_event_name:
+                default_event_name = ocr_event_name
+            else:
+                artist_he = st.session_state.get('concert_artist_he', '')
+                venue_name = st.session_state.get('concert_venue_name', '')
+                if artist_he and venue_name:
+                    default_event_name = f"הופעה של {artist_he} ב{venue_name}"
+                elif artist_he:
+                    default_event_name = f"הופעה של {artist_he}"
         
         event_name = st.text_input("שם האירוע", value=default_event_name, placeholder="לדוגמה: Real Madrid vs Barcelona")
         
@@ -2364,6 +2718,25 @@ def page_new_order():
             try:
                 from datetime import datetime as dt
                 time_str = extracted_time[:5] if len(extracted_time) >= 5 else extracted_time
+                default_time = dt.strptime(time_str, "%H:%M").time()
+            except:
+                pass
+        
+        ocr_date = st.session_state.get('_ocr_event_date', '')
+        ocr_time = st.session_state.get('_ocr_event_time', '')
+        if ocr_date and not default_date:
+            try:
+                from datetime import datetime as dt
+                default_date = dt.strptime(ocr_date, "%d/%m/%Y").date()
+            except:
+                try:
+                    default_date = dt.strptime(ocr_date, "%Y-%m-%d").date()
+                except:
+                    pass
+        if ocr_time and not default_time:
+            try:
+                from datetime import datetime as dt
+                time_str = ocr_time[:5] if len(ocr_time) >= 5 else ocr_time
                 default_time = dt.strptime(time_str, "%H:%M").time()
             except:
                 pass
@@ -2594,6 +2967,14 @@ def page_new_order():
                 st.session_state.hotel_data = {}
             
             hd = st.session_state.hotel_data
+            
+            if hd.get('hotel_image_path') and os.path.exists(hd.get('hotel_image_path', '')):
+                hotel_image = hd.get('hotel_image_path')
+            if hd.get('hotel_image_path_2') and os.path.exists(hd.get('hotel_image_path_2', '')):
+                hotel_image_2 = hd.get('hotel_image_path_2')
+            
+            if hd.get('from_package') and hd.get('hotel_address'):
+                st.success(f"✅ פרטי המלון נטענו מהחבילה: {hd.get('hotel_name', '')}")
             
             col_hotel, col_btn = st.columns([3, 1])
             with col_hotel:
@@ -3064,16 +3445,25 @@ def page_new_order():
             birth_key = f"birth_date_{i}"
             exp_key = f"passport_expiry_{i}"
             
-            if fn_key not in st.session_state:
-                st.session_state[fn_key] = passenger.get('first_name', '')
-            if ln_key not in st.session_state:
-                st.session_state[ln_key] = passenger.get('last_name', '')
-            if passport_key not in st.session_state:
-                st.session_state[passport_key] = passenger.get('passport', '')
-            if birth_key not in st.session_state:
-                st.session_state[birth_key] = passenger.get('birth_date', '')
-            if exp_key not in st.session_state:
-                st.session_state[exp_key] = passenger.get('passport_expiry', '')
+            # Always sync from passenger_list to session_state on each render
+            # This ensures OCR-scanned data is properly displayed
+            stored_first = passenger.get('first_name', '')
+            stored_last = passenger.get('last_name', '')
+            stored_passport = passenger.get('passport', '')
+            stored_birth = passenger.get('birth_date', '')
+            stored_exp = passenger.get('passport_expiry', '')
+            
+            # Initialize if not in session state, or if passenger_list has newer data
+            if fn_key not in st.session_state or (stored_first and not st.session_state.get(fn_key)):
+                st.session_state[fn_key] = stored_first
+            if ln_key not in st.session_state or (stored_last and not st.session_state.get(ln_key)):
+                st.session_state[ln_key] = stored_last
+            if passport_key not in st.session_state or (stored_passport and not st.session_state.get(passport_key)):
+                st.session_state[passport_key] = stored_passport
+            if birth_key not in st.session_state or (stored_birth and not st.session_state.get(birth_key)):
+                st.session_state[birth_key] = stored_birth
+            if exp_key not in st.session_state or (stored_exp and not st.session_state.get(exp_key)):
+                st.session_state[exp_key] = stored_exp
             
             col_fn, col_ln, col_type, col_del = st.columns([1.3, 1.3, 1.2, 0.3])
             with col_fn:
@@ -3124,8 +3514,15 @@ def page_new_order():
             st.image(stadium_image, caption="תרשים מושבים", use_container_width=True)
         elif auto_stadium_map and os.path.exists(auto_stadium_map):
             st.image(auto_stadium_map, caption="תרשים מושבים (אוטומטי)", use_container_width=True)
-        if hotel_image:
-            st.image(hotel_image, caption="תמונת המלון", use_container_width=True)
+        if hotel_image or hotel_image_2:
+            if hotel_image and hotel_image_2:
+                col_h1, col_h2 = st.columns(2)
+                with col_h1:
+                    st.image(hotel_image, caption="תמונת המלון 1", use_container_width=True)
+                with col_h2:
+                    st.image(hotel_image_2, caption="תמונת המלון 2", use_container_width=True)
+            elif hotel_image:
+                st.image(hotel_image, caption="תמונת המלון", use_container_width=True)
         
         st.markdown("#### 📋 סיכום ההזמנה")
         
@@ -3215,33 +3612,169 @@ def page_new_order():
             hotel_img = None
             hotel_img_2 = None
             
+            def safe_open_image(path_or_image):
+                """Safely open image, skipping SVG files that PIL can't handle"""
+                try:
+                    if path_or_image is None:
+                        return None
+                    if isinstance(path_or_image, Image.Image):
+                        return path_or_image
+                    if isinstance(path_or_image, str):
+                        # Skip SVG files - PIL can't handle them
+                        if path_or_image.lower().endswith('.svg'):
+                            return None
+                        if os.path.exists(path_or_image):
+                            return Image.open(path_or_image)
+                    return None
+                except Exception as e:
+                    print(f"Error opening image: {e}")
+                    return None
+            
             if stadium_image:
-                if isinstance(stadium_image, Image.Image):
-                    stadium_img = stadium_image
-                else:
-                    stadium_img = Image.open(stadium_image)
-            elif auto_stadium_map and os.path.exists(auto_stadium_map):
-                stadium_img = Image.open(auto_stadium_map)
-            elif rd.get('use_sample_images') and os.path.exists('attached_assets/stock_images/football_stadium_int_9fde699a.jpg'):
+                stadium_img = safe_open_image(stadium_image)
+            elif auto_stadium_map:
+                stadium_img = safe_open_image(auto_stadium_map)
+            
+            if not stadium_img and rd.get('use_sample_images') and os.path.exists('attached_assets/stock_images/football_stadium_int_9fde699a.jpg'):
                 stadium_img = Image.open('attached_assets/stock_images/football_stadium_int_9fde699a.jpg')
             
             random_atmosphere = get_random_atmosphere_image(event_type)
-            if random_atmosphere and os.path.exists(random_atmosphere):
-                stadium_photo_img = Image.open(random_atmosphere)
+            if random_atmosphere:
+                stadium_photo_img = safe_open_image(random_atmosphere)
             
             if hotel_image:
-                hotel_img = Image.open(hotel_image)
+                hotel_img = safe_open_image(hotel_image)
             elif rd.get('use_sample_images') and os.path.exists('attached_assets/stock_images/luxury_hotel_exterio_3264e2db.jpg'):
                 hotel_img = Image.open('attached_assets/stock_images/luxury_hotel_exterio_3264e2db.jpg')
             
             if hotel_image_2:
-                hotel_img_2 = Image.open(hotel_image_2)
+                hotel_img_2 = safe_open_image(hotel_image_2)
             
             template_version = 2
             
             st.markdown("### 📤 פעולות")
             
-            if st.button("📄 צור PDF ושמור הזמנה", type="primary", use_container_width=True):
+            col_btn1, col_btn2 = st.columns(2)
+            with col_btn1:
+                if st.button("📦 שמור כחבילה קבועה", type="secondary", use_container_width=True):
+                    st.session_state['show_save_package_form'] = True
+            with col_btn2:
+                generate_pdf_btn = st.button("📄 צור PDF ושמור הזמנה", type="primary", use_container_width=True)
+            
+            if st.session_state.get('package_saved_success'):
+                st.success(f"✅ החבילה '{st.session_state['package_saved_success']}' נשמרה בהצלחה!")
+                st.info("💡 תוכל למצוא אותה ב'חבילות קבועות' בתפריט או לטעון אותה מהרשימה למעלה.")
+                del st.session_state['package_saved_success']
+            
+            if st.session_state.get('show_save_package_form'):
+                st.markdown("---")
+                st.markdown("#### 📦 שמירה כחבילה קבועה")
+                
+                default_pkg_name = f"{event_name} - {category}" if event_name else ""
+                pkg_name_input = st.text_input("📝 שם החבילה", value=default_pkg_name, placeholder="למשל: סטינג לימסול 2026 - גולדן", key="save_pkg_name")
+                
+                col_save, col_cancel = st.columns(2)
+                with col_save:
+                    confirm_save = st.button("💾 אשר שמירת חבילה", use_container_width=True, type="primary")
+                with col_cancel:
+                    if st.button("❌ ביטול", use_container_width=True):
+                        st.session_state['show_save_package_form'] = False
+                        st.rerun()
+                
+                if confirm_save:
+                    if not pkg_name_input:
+                        st.error("❌ יש להזין שם לחבילה")
+                    else:
+                        db = get_db()
+                        if db:
+                            try:
+                                event_type_map = {'הופעה': EventType.CONCERT, 'כדורגל': EventType.FOOTBALL, 'אחר': EventType.OTHER}
+                                event_type_enum = event_type_map.get(event_type, EventType.OTHER)
+                                product_type_val = "full_package" if product_type == "package" else "tickets_only"
+                                
+                                hotel_data_json = {}
+                                if product_type == "package":
+                                    hd_save = st.session_state.get('hotel_data', {})
+                                    hotel_data_json = {
+                                        'name': hd_save.get('hotel_name') or hotel_name,
+                                        'check_in': hd_save.get('check_in', ''),
+                                        'check_out': hd_save.get('check_out', ''),
+                                        'address': hd_save.get('hotel_address', ''),
+                                        'website': hd_save.get('hotel_website', ''),
+                                        'rating': hd_save.get('hotel_rating', ''),
+                                        'stars': hotel_stars,
+                                        'nights': hotel_nights,
+                                        'meals': hotel_meals
+                                    }
+                                
+                                flight_data_json = {}
+                                if product_type == "package" and flights_list:
+                                    outbound_flight = next((f for f in flights_list if f.get('direction') == 'הלוך'), {})
+                                    return_flight = next((f for f in flights_list if f.get('direction') == 'חזור'), {})
+                                    flight_data_json = {
+                                        'outbound': {
+                                            'from': outbound_flight.get('from', ''),
+                                            'to': outbound_flight.get('to', ''),
+                                            'date': outbound_flight.get('date', ''),
+                                            'time': outbound_flight.get('time', ''),
+                                            'flight_number': outbound_flight.get('flight_no', '')
+                                        },
+                                        'return': {
+                                            'from': return_flight.get('from', ''),
+                                            'to': return_flight.get('to', ''),
+                                            'date': return_flight.get('date', ''),
+                                            'time': return_flight.get('time', ''),
+                                            'flight_number': return_flight.get('flight_no', '')
+                                        }
+                                    }
+                                
+                                stadium_map_bytes = None
+                                if st.session_state.get('saved_stadium_map_bytes'):
+                                    stadium_map_bytes = st.session_state.get('saved_stadium_map_bytes')
+                                elif st.session_state.get('pasted_stadium_map'):
+                                    pasted_img = st.session_state.get('pasted_stadium_map')
+                                    img_byte_arr = io.BytesIO()
+                                    pasted_img.save(img_byte_arr, format='PNG')
+                                    stadium_map_bytes = img_byte_arr.getvalue()
+                                elif auto_stadium_map and os.path.exists(auto_stadium_map):
+                                    with open(auto_stadium_map, 'rb') as f:
+                                        stadium_map_bytes = f.read()
+                                
+                                if hotel_data_json and product_type == "package":
+                                    hotel_data_json['image_path'] = hd_save.get('hotel_image_path', '')
+                                    hotel_data_json['image_path_2'] = hd_save.get('hotel_image_path_2', '')
+                                
+                                new_pkg = PackageTemplate(
+                                    name=pkg_name_input,
+                                    event_type=event_type_enum,
+                                    product_type=product_type_val,
+                                    event_name=event_name,
+                                    event_date=event_date.strftime('%d/%m/%Y'),
+                                    event_time=event_time.strftime('%H:%M'),
+                                    venue=venue,
+                                    ticket_description=ticket_description,
+                                    ticket_category=category,
+                                    price_per_ticket_euro=float(price_foreign),
+                                    hotel_data=json.dumps(hotel_data_json) if hotel_data_json else None,
+                                    flight_data=json.dumps(flight_data_json) if flight_data_json else None,
+                                    package_price_euro=float(price_foreign),
+                                    stadium_map_data=stadium_map_bytes,
+                                    stadium_map_mime='image/png' if stadium_map_bytes else None,
+                                    notes=""
+                                )
+                                
+                                db.add(new_pkg)
+                                db.commit()
+                                st.session_state['package_saved_success'] = pkg_name_input
+                                st.session_state['show_save_package_form'] = False
+                                st.rerun()
+                            except Exception as e:
+                                db.rollback()
+                                st.error(f"❌ שגיאה בשמירה: {str(e)}")
+                            finally:
+                                db.close()
+            
+            if generate_pdf_btn:
                 order_number = generate_order_number()
                 order_data['order_number'] = order_number
                 
@@ -4134,6 +4667,142 @@ def page_change_password():
         
         st.markdown('</div>', unsafe_allow_html=True)
 
+def page_package_templates():
+    """Page for managing package templates"""
+    st.markdown("""
+    <div class="header-container">
+        <h1>📦 חבילות קבועות</h1>
+        <p>ניהול חבילות קבועות לשימוש חוזר</p>
+    </div>
+    """, unsafe_allow_html=True)
+    
+    if st.button("⬅️ חזרה לתפריט"):
+        st.session_state.admin_page = None
+        st.rerun()
+    
+    st.markdown("---")
+    
+    st.info("💡 **ליצור חבילה חדשה:** מלא את טופס ההזמנה הרגיל ולחץ על '📦 שמור כחבילה קבועה' בסוף.")
+    
+    st.markdown("### 📋 חבילות שמורות")
+    
+    db = get_db()
+    packages = []
+    if db:
+        try:
+            packages = db.query(PackageTemplate).filter(PackageTemplate.is_active == True).order_by(PackageTemplate.created_at.desc()).all()
+        except:
+            pass
+        finally:
+            db.close()
+    
+    if not packages:
+        st.info("📦 אין חבילות שמורות. לך להזמנה חדשה ושמור חבילה משם.")
+    else:
+        st.markdown(f"**סה\"כ: {len(packages)} חבילות**")
+        
+        for pkg in packages:
+            pkg_data = pkg.to_dict()
+            with st.container():
+                st.markdown('<div class="form-section">', unsafe_allow_html=True)
+                
+                col1, col2, col3 = st.columns([4, 2, 2])
+                
+                with col1:
+                    event_emoji = "🎤" if pkg_data.get('event_type') == 'concert' else "⚽" if pkg_data.get('event_type') == 'football' else "🎭"
+                    st.markdown(f"### {event_emoji} {pkg_data.get('name', 'ללא שם')}")
+                    if pkg_data.get('event_name'):
+                        st.markdown(f"🎫 {pkg_data.get('event_name')}")
+                    if pkg_data.get('venue'):
+                        st.markdown(f"📍 {pkg_data.get('venue')}")
+                
+                with col2:
+                    if pkg_data.get('event_date'):
+                        st.markdown(f"📅 {pkg_data.get('event_date')}")
+                    if pkg_data.get('ticket_category'):
+                        st.markdown(f"🎟️ {pkg_data.get('ticket_category')}")
+                    if pkg_data.get('package_price_euro'):
+                        st.markdown(f"💶 {pkg_data.get('package_price_euro'):.0f}€ לאדם")
+                
+                with col3:
+                    btn_col1, btn_col2 = st.columns(2)
+                    with btn_col1:
+                        if st.button("📋 שכפל", key=f"dup_pkg_{pkg.id}", use_container_width=True):
+                            dup_db = get_db()
+                            if dup_db:
+                                try:
+                                    new_pkg = PackageTemplate(
+                                        name=f"{pkg.name} (עותק)",
+                                        event_type=pkg.event_type,
+                                        product_type=pkg.product_type,
+                                        event_name=pkg.event_name,
+                                        event_date=pkg.event_date,
+                                        event_time=pkg.event_time,
+                                        venue=pkg.venue,
+                                        ticket_description=pkg.ticket_description,
+                                        ticket_category=pkg.ticket_category,
+                                        price_per_ticket_euro=pkg.price_per_ticket_euro,
+                                        hotel_data=pkg.hotel_data,
+                                        flight_data=pkg.flight_data,
+                                        package_price_euro=pkg.package_price_euro,
+                                        stadium_map_data=pkg.stadium_map_data,
+                                        stadium_map_mime=pkg.stadium_map_mime,
+                                        notes=pkg.notes
+                                    )
+                                    dup_db.add(new_pkg)
+                                    dup_db.commit()
+                                    st.success("✅ החבילה שוכפלה!")
+                                    st.rerun()
+                                except:
+                                    dup_db.rollback()
+                                finally:
+                                    dup_db.close()
+                    with btn_col2:
+                        if st.button("🗑️", key=f"del_pkg_{pkg.id}", use_container_width=True):
+                            del_db = get_db()
+                            if del_db:
+                                try:
+                                    del_db.query(PackageTemplate).filter(PackageTemplate.id == pkg.id).update({'is_active': False})
+                                    del_db.commit()
+                                    st.success("✅ החבילה נמחקה!")
+                                    st.rerun()
+                                except:
+                                    del_db.rollback()
+                                finally:
+                                    del_db.close()
+                
+                with st.expander("📄 פרטים מלאים"):
+                    col1, col2 = st.columns(2)
+                    with col1:
+                        st.markdown("**פרטי אירוע:**")
+                        st.write(f"- סוג: {pkg_data.get('event_type')}")
+                        st.write(f"- תאריך: {pkg_data.get('event_date')} {pkg_data.get('event_time')}")
+                        st.write(f"- מקום: {pkg_data.get('venue')}")
+                        st.write(f"- קטגוריה: {pkg_data.get('ticket_category')}")
+                        if pkg_data.get('ticket_description'):
+                            st.write(f"- תיאור: {pkg_data.get('ticket_description')}")
+                    
+                    with col2:
+                        hotel = pkg_data.get('hotel', {})
+                        if hotel:
+                            st.markdown("**פרטי מלון:**")
+                            st.write(f"- שם: {hotel.get('name', 'לא הוגדר')}")
+                            st.write(f"- צ'ק-אין: {hotel.get('check_in', '')}")
+                            st.write(f"- צ'ק-אאוט: {hotel.get('check_out', '')}")
+                        
+                        flights = pkg_data.get('flights', {})
+                        if flights:
+                            st.markdown("**טיסות:**")
+                            outbound = flights.get('outbound', {})
+                            if outbound:
+                                st.write(f"- הלוך: {outbound.get('date')} {outbound.get('time')} | {outbound.get('flight_number')}")
+                            ret = flights.get('return', {})
+                            if ret:
+                                st.write(f"- חזור: {ret.get('date')} {ret.get('time')} | {ret.get('flight_number')}")
+                
+                st.markdown('</div>', unsafe_allow_html=True)
+                st.markdown("")
+
 def page_saved_concerts():
     """Page for managing saved concerts and artists"""
     st.markdown("""
@@ -4913,6 +5582,8 @@ def main():
     
     st.sidebar.markdown("---")
     st.sidebar.markdown("##### 🔧 כלים")
+    if st.sidebar.button("📦 חבילות קבועות", use_container_width=True):
+        st.session_state.admin_page = "packages"
     if st.sidebar.button("📖 מדריך למתחיל", use_container_width=True):
         st.session_state.admin_page = "beginner_guide"
     if st.sidebar.button("❓ עזרה", use_container_width=True):
@@ -4943,7 +5614,9 @@ def main():
     render_ai_chatbot()
     
     # Determine which page to show
-    if st.session_state.get("admin_page") == "beginner_guide":
+    if st.session_state.get("admin_page") == "packages":
+        page_package_templates()
+    elif st.session_state.get("admin_page") == "beginner_guide":
         page_beginner_guide()
     elif st.session_state.get("admin_page") == "help":
         page_help()
