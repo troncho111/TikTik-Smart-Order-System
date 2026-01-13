@@ -27,6 +27,53 @@ LEAGUE_IDS = {
     "UEFA Champions League": 4480
 }
 
+# Fallback teams for Champions League (2024-25 season)
+CHAMPIONS_LEAGUE_TEAMS = [
+    {"name": "Real Madrid", "stadium": "Santiago Bernabeu", "stadium_location": "Madrid, Spain", "capacity": "81044"},
+    {"name": "Barcelona", "stadium": "Estadi Olimpic Lluis Companys", "stadium_location": "Barcelona, Spain", "capacity": "55926"},
+    {"name": "Manchester City", "stadium": "Etihad Stadium", "stadium_location": "Manchester, England", "capacity": "55017"},
+    {"name": "Bayern Munich", "stadium": "Allianz Arena", "stadium_location": "Munich, Germany", "capacity": "75000"},
+    {"name": "Paris Saint-Germain", "stadium": "Parc des Princes", "stadium_location": "Paris, France", "capacity": "47929"},
+    {"name": "Liverpool", "stadium": "Anfield", "stadium_location": "Liverpool, England", "capacity": "61276"},
+    {"name": "Inter Milan", "stadium": "San Siro", "stadium_location": "Milan, Italy", "capacity": "75923"},
+    {"name": "AC Milan", "stadium": "San Siro", "stadium_location": "Milan, Italy", "capacity": "75923"},
+    {"name": "Borussia Dortmund", "stadium": "Signal Iduna Park", "stadium_location": "Dortmund, Germany", "capacity": "81365"},
+    {"name": "Juventus", "stadium": "Allianz Stadium", "stadium_location": "Turin, Italy", "capacity": "41507"},
+    {"name": "Atletico Madrid", "stadium": "Civitas Metropolitano", "stadium_location": "Madrid, Spain", "capacity": "70460"},
+    {"name": "Arsenal", "stadium": "Emirates Stadium", "stadium_location": "London, England", "capacity": "60704"},
+    {"name": "Chelsea", "stadium": "Stamford Bridge", "stadium_location": "London, England", "capacity": "40834"},
+    {"name": "Manchester United", "stadium": "Old Trafford", "stadium_location": "Manchester, England", "capacity": "74310"},
+    {"name": "Napoli", "stadium": "Stadio Diego Armando Maradona", "stadium_location": "Naples, Italy", "capacity": "54726"},
+    {"name": "Benfica", "stadium": "Estadio da Luz", "stadium_location": "Lisbon, Portugal", "capacity": "64642"},
+    {"name": "Porto", "stadium": "Estadio do Dragao", "stadium_location": "Porto, Portugal", "capacity": "50033"},
+    {"name": "Sporting CP", "stadium": "Estadio Jose Alvalade", "stadium_location": "Lisbon, Portugal", "capacity": "50095"},
+    {"name": "Ajax", "stadium": "Johan Cruyff Arena", "stadium_location": "Amsterdam, Netherlands", "capacity": "55500"},
+    {"name": "PSV Eindhoven", "stadium": "Philips Stadion", "stadium_location": "Eindhoven, Netherlands", "capacity": "35000"},
+    {"name": "Feyenoord", "stadium": "De Kuip", "stadium_location": "Rotterdam, Netherlands", "capacity": "51117"},
+    {"name": "RB Leipzig", "stadium": "Red Bull Arena", "stadium_location": "Leipzig, Germany", "capacity": "47069"},
+    {"name": "Bayer Leverkusen", "stadium": "BayArena", "stadium_location": "Leverkusen, Germany", "capacity": "30210"},
+    {"name": "Atalanta", "stadium": "Gewiss Stadium", "stadium_location": "Bergamo, Italy", "capacity": "24642"},
+    {"name": "Monaco", "stadium": "Stade Louis II", "stadium_location": "Monaco", "capacity": "18523"},
+    {"name": "Lille", "stadium": "Stade Pierre-Mauroy", "stadium_location": "Lille, France", "capacity": "50157"},
+    {"name": "Celtic", "stadium": "Celtic Park", "stadium_location": "Glasgow, Scotland", "capacity": "60411"},
+    {"name": "Rangers", "stadium": "Ibrox Stadium", "stadium_location": "Glasgow, Scotland", "capacity": "50817"},
+    {"name": "Club Brugge", "stadium": "Jan Breydelstadion", "stadium_location": "Bruges, Belgium", "capacity": "29042"},
+    {"name": "Shakhtar Donetsk", "stadium": "Arena Lviv", "stadium_location": "Lviv, Ukraine", "capacity": "34915"},
+    {"name": "Dinamo Zagreb", "stadium": "Stadion Maksimir", "stadium_location": "Zagreb, Croatia", "capacity": "35123"},
+    {"name": "Red Star Belgrade", "stadium": "Rajko Mitic Stadium", "stadium_location": "Belgrade, Serbia", "capacity": "55538"},
+    {"name": "Salzburg", "stadium": "Red Bull Arena Salzburg", "stadium_location": "Salzburg, Austria", "capacity": "30188"},
+    {"name": "Young Boys", "stadium": "Stade de Suisse", "stadium_location": "Bern, Switzerland", "capacity": "31983"},
+    {"name": "Copenhagen", "stadium": "Parken Stadium", "stadium_location": "Copenhagen, Denmark", "capacity": "38065"},
+    {"name": "Bologna", "stadium": "Stadio Renato Dall'Ara", "stadium_location": "Bologna, Italy", "capacity": "38279"},
+    {"name": "Girona", "stadium": "Estadi Montilivi", "stadium_location": "Girona, Spain", "capacity": "14286"},
+    {"name": "Aston Villa", "stadium": "Villa Park", "stadium_location": "Birmingham, England", "capacity": "42640"},
+    {"name": "Brest", "stadium": "Stade Francis-Le Ble", "stadium_location": "Brest, France", "capacity": "15220"},
+    {"name": "Stuttgart", "stadium": "MHPArena", "stadium_location": "Stuttgart, Germany", "capacity": "60449"},
+    {"name": "Sparta Prague", "stadium": "Letna Stadium", "stadium_location": "Prague, Czech Republic", "capacity": "19370"},
+    {"name": "Slovan Bratislava", "stadium": "Tehelne pole", "stadium_location": "Bratislava, Slovakia", "capacity": "22500"},
+    {"name": "Sturm Graz", "stadium": "Merkur Arena", "stadium_location": "Graz, Austria", "capacity": "16364"},
+]
+
 OPENFOOTBALL_URLS = {
     "Spanish La Liga": "https://raw.githubusercontent.com/openfootball/football.json/master/2024-25/es.1.json",
     "English Premier League": "https://raw.githubusercontent.com/openfootball/football.json/master/2024-25/en.1.json",
@@ -206,6 +253,10 @@ def get_english_name(hebrew_name: str) -> str:
 @lru_cache(maxsize=20)
 def get_teams_by_league(league_name: str) -> list:
     """Get all teams in a league"""
+    # Use hardcoded Champions League teams for reliability
+    if league_name == "UEFA Champions League":
+        return CHAMPIONS_LEAGUE_TEAMS
+    
     try:
         url = f"https://www.thesportsdb.com/api/v1/json/3/search_all_teams.php?l={league_name}"
         response = requests.get(url, timeout=10)
